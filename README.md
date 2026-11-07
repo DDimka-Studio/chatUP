@@ -12,7 +12,7 @@ Get the files (assuming the repository is called `chatup`):
 
 ```bash
 git clone https://github.com/DDimka-Studio/chatUP.git
-cd chatup
+cd chatUP
 ```
 
 **Linux / macOS**: run the installer from the folder with `chatup.py`:
