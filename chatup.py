@@ -686,6 +686,21 @@ def wrapped_program(args: list) -> int:
     return -1
 
 
+def program_words(argv: list) -> list:
+    """Every word that could be a program name, as (position, name). Flags and VAR=value words are skipped.
+
+    Why: programs like env, nice, timeout, xargs or find -exec just start another program. Looking only at
+    the first word let 'env dd ...' or 'nice apt-get ...' slip past every check. Looking at every word
+    catches them, at the price of being a bit stricter (a file named 'sudo' now counts as a program too).
+    """
+    words = []
+    for idx, tok in enumerate(argv):
+        if tok.startswith("-") or "=" in tok:
+            continue
+        words.append((idx, program_name(tok)))
+    return words
+
+
 def check_command(command: str, cfg: Config) -> tuple:
     """Check one 'run' line. Returns (argv, privileged, danger_name), or complains with ChatupError."""
     if not command.strip():
@@ -711,57 +726,63 @@ def check_command(command: str, cfg: Config) -> tuple:
         return ["cd", normalize_rel_path(argv[1].rstrip("/\\"))], False, ""
     if ".." in argv[0].replace("\\", "/").split("/"):
         raise ChatupError("'..' is not allowed in the program path")
+
     prog = program_name(argv[0])
-    names = [prog]
-    eff, eff_args = prog, argv[1:]
-    if prog in WRAPPERS:  # look at the program sudo/doas will actually start, too
-        idx = wrapped_program(argv[1:])
-        if idx < 0:
-            raise ChatupError(f"'{prog}' needs a command to run after it (a bare root shell can't be started from chatup: open one yourself)")
-        eff = program_name(argv[1:][idx])
-        eff_args = argv[1:][idx + 1:]
-        names.append(eff)
+    words = program_words(argv)
+    if prog in WRAPPERS and wrapped_program(argv[1:]) < 0:
+        raise ChatupError(f"'{prog}' needs a command to run after it (a bare root shell can't be started from chatup: open one yourself)")
     if "pip" in cfg.no_allow_command and argv[1:3] == ["-m", "pip"]:
         raise ChatupError("program 'pip' is blocked")
+
     privileged = False
     danger_name = ""
-    for name in names:
+    for _, name in words:
         if name in NEVER_PROGRAMS or name in cfg.no_allow_command:
             raise ChatupError(f"program '{name}' is blocked")
         if name in DANGEROUS_PROGRAMS or name.startswith("mkfs"):
             danger_name = name
         if name in PRIVILEGED:
             privileged = True
+
     if any(a.lower().lstrip("-") == "break-system-packages" for a in argv[1:]):
         raise ChatupError("'--break-system-packages' can break your system Python: use a virtual environment "
                           "instead (python3 -m venv .venv, then .venv/bin/pip install ...)")
     if prog == "su" and any(a in ("-c", "--command") for a in argv[1:]):
         raise ChatupError("'su -c' runs hidden shell code and is blocked")
-    if eff in SHELLS and shell_runs_inline_code(eff, eff_args):
-        raise ChatupError("inline shell code (-c, /c, -Command) is blocked: write the commands into a script file and run that "
-                          "(for root: '@@@ run sudo sh script.sh')")
-    if eff in PATH_ARG_PROGRAMS:
-        deleting = eff in DELETE_PROGRAMS
-        outside = False
-        for arg in eff_args:
-            if arg.startswith("-"):
-                continue
-            if os.name == "nt" and re.fullmatch(r"/[A-Za-z?]", arg):
-                continue
-            if arg in (".", "./") and not deleting:
-                continue  # '.' (the project folder) is fine to copy into, but never to delete
-            try:
-                rel = normalize_rel_path(arg.rstrip("/\\") or "/")
-            except ChatupError:
-                if not privileged:
-                    raise ChatupError(f"'{eff}' argument '{clean_text(arg, 60)}' must be a plain path inside the project; "
-                                      "for system paths the command needs sudo") from None
-                outside = True  # this is exactly what sudo is for, and its own typed phrase covers it
-                continue
-            if cfg.deny and path_matches(rel, cfg.deny):
-                raise ChatupError(f"'{rel}' is blocked by 'deny' in {CONFIG_NAME}")
-        if outside and deleting and not danger_name:
-            danger_name = eff  # deleting things outside the project gets the strictest check
+
+    # A '..' in any argument could point outside the project (e.g. 'bash ../../x.sh'), unless sudo is used.
+    if not privileged:
+        for arg in argv[1:]:
+            if not arg.startswith("-") and ".." in arg.replace("\\", "/").split("/"):
+                raise ChatupError(f"'..' is not allowed in '{clean_text(arg, 60)}': paths must stay inside the project")
+
+    for idx, name in words:
+        args = argv[idx + 1:]
+        if name in SHELLS and shell_runs_inline_code(name, args):
+            raise ChatupError("inline shell code (-c, /c, -Command) is blocked: write the commands into a script file and run that "
+                              "(for root: '@@@ run sudo sh script.sh')")
+        if name in PATH_ARG_PROGRAMS:
+            deleting = name in DELETE_PROGRAMS
+            outside = False
+            for arg in args:
+                if arg.startswith("-"):
+                    continue
+                if os.name == "nt" and re.fullmatch(r"/[A-Za-z?]", arg):
+                    continue
+                if arg in (".", "./") and not deleting:
+                    continue  # '.' (the project folder) is fine to copy into, but never to delete
+                try:
+                    rel = normalize_rel_path(arg.rstrip("/\\") or "/")
+                except ChatupError:
+                    if not privileged:
+                        raise ChatupError(f"'{name}' argument '{clean_text(arg, 60)}' must be a plain path inside the project; "
+                                          "for system paths the command needs sudo") from None
+                    outside = True  # this is exactly what sudo is for, and its own typed phrase covers it
+                    continue
+                if cfg.deny and path_matches(rel, cfg.deny):
+                    raise ChatupError(f"'{rel}' is blocked by 'deny' in {CONFIG_NAME}")
+            if outside and deleting and not danger_name:
+                danger_name = name  # deleting things outside the project gets the strictest check
     return argv, privileged, danger_name
 
 
